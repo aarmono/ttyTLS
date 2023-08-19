@@ -96,22 +96,20 @@ void flush_tty(int fd)
 
     fd_set rd_fds;
     FD_ZERO(&rd_fds);
-
     FD_SET(fd, &rd_fds);
 
     struct timeval tv;
     memset(&tv, 0, sizeof(tv));
 
-    if (select(2, &rd_fds, NULL, NULL, &tv) > 0)
+    while (select(fd + 1, &rd_fds, NULL, NULL, &tv) > 0)
     {
         read(fd, buffer, sizeof(buffer));
+
+        FD_ZERO(&rd_fds);
+        FD_SET(fd, &rd_fds);
     }
 }
 
-/*
- * Taken from:
- * https://tldp.org/HOWTO/Serial-Programming-HOWTO/x115.html
- */
 void configure_tty(int fd)
 {
     struct termios termarg;
@@ -124,6 +122,8 @@ void configure_tty(int fd)
     termarg.c_cflag = (CRTSCTS | CS8);
     termarg.c_cc[VMIN] = 1;
     termarg.c_cc[VTIME] = 0;
+
+    cfsetspeed(&termarg, B115200);
 
     tcsetattr(fd, TCSANOW, &termarg);
     flush_tty(fd);
