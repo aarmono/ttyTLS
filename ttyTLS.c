@@ -118,11 +118,10 @@ void configure_tty(int fd)
     struct termios termarg;
 
     memset(&termarg, 0, sizeof(termarg));
-    // "rawer" option from socat + flow control
-    termarg.c_iflag = 0;
-    termarg.c_oflag = 0;
-    termarg.c_lflag = 0;
-    termarg.c_cflag = (CRTSCTS | CS8);
+    cfmakeraw(&termarg);
+
+    termarg.c_cflag |=  (CRTSCTS | CREAD);
+
     termarg.c_cc[VMIN] = 1;
     termarg.c_cc[VTIME] = 0;
 
@@ -279,26 +278,20 @@ int tls_established(WOLFSSL* ssl)
 
         int nfds = (fd_pty > fd_tty ? fd_pty : fd_tty) + 1;
 
-        struct timeval tv;
-        if (timeout > 0)
+        struct timeval tv =
         {
-            tv.tv_sec = timeout;
-            tv.tv_usec = 0;
-        }
-        else
-        {
-            tv.tv_sec = 0;
-            tv.tv_usec = 50000;
+            .tv_sec = timeout,
+            .tv_usec = 0
         };
 
-        ret = select(nfds, &rd_fds, NULL, NULL, &tv);
+        ret = select(nfds, &rd_fds, NULL, NULL, timeout > 0 ? &tv : NULL);
         if (ret < 0)
         {
             fprintf(stderr, "Error calling select\n");
             ret = 1;
             break;
         }
-        else if (timeout > 0 && ret == 0)
+        else if (ret == 0)
         {
             fprintf(stderr, "Timeout\n");
             ret = 0;
