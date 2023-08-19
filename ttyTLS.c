@@ -41,6 +41,8 @@ static int tls_server();
 static int cb_recv(WOLFSSL *ssl, char *buf, int sz, void *ctx);
 static int cb_send(WOLFSSL *ssl, char *buf, int sz, void *ctx);
 
+static ssize_t write_all(int fd, const void* buf, size_t size);
+
 static void configure_tty(int fd);
 static int open_tty(const char* device);
 static int create_pty();
@@ -76,14 +78,8 @@ int cb_recv(WOLFSSL *ssl, char *buf, int sz, void *ctx)
 {
     (void) ssl;
     (void) ctx;
-    int ret = 0;
 
-    while (ret <= 0)
-    {
-        ret = (int)read(fd_tty, buf, (size_t)sz);
-    }
-
-    return ret;
+    return (int)read(fd_tty, buf, (size_t)sz);
 }
 
 int cb_send(WOLFSSL *ssl, char *buf, int sz, void *ctx)
@@ -118,20 +114,18 @@ void flush_tty(int fd)
  */
 void configure_tty(int fd)
 {
-    struct termios newtio;
+    struct termios termarg;
 
-    memset(&newtio, 0, sizeof(newtio));
-    newtio.c_cflag = CRTSCTS | CS8 | CLOCAL | CREAD;
-    newtio.c_iflag = IGNPAR;
-    newtio.c_oflag = 0;
+    memset(&termarg, 0, sizeof(termarg));
+    // "rawer" option from socat + flow control
+    termarg.c_iflag = 0;
+    termarg.c_oflag = 0;
+    termarg.c_lflag = 0;
+    termarg.c_cflag = (CRTSCTS | CS8);
+    termarg.c_cc[VMIN] = 1;
+    termarg.c_cc[VTIME] = 0;
 
-    /* set input mode (non-canonical, no echo,...) */
-    newtio.c_lflag = 0;
-
-    newtio.c_cc[VTIME]    = 0;   /* inter-character timer unused */
-    newtio.c_cc[VMIN]     = 1;   /* blocking read until a char received */
-
-    tcsetattr(fd, TCSANOW, &newtio);
+    tcsetattr(fd, TCSANOW, &termarg);
     flush_tty(fd);
 }
 
@@ -139,7 +133,7 @@ int open_tty(const char* device)
 {
     int fd;
 
-    fd = open(device, O_RDWR | O_NOCTTY ); 
+    fd = open(device, O_RDWR | O_NOCTTY);
     if (fd < 0)
     {
         return -1;
@@ -229,6 +223,35 @@ WOLFSSL* create_client(WOLFSSL_CTX** ctx, char* suite, int set_suite)
     return create_wolf_ssl(wolfTLSv1_3_client_method, ctx, suite, set_suite);
 }
 
+ssize_t write_all(int fd, const void* buf, size_t len)
+{
+    size_t written = 0;
+    const char* char_buf = (const char*)buf;
+
+    while (written < len)
+    {
+        fd_set wr_fds;
+        FD_ZERO(&wr_fds);
+
+        FD_SET(fd, &wr_fds);
+
+        if (select(fd + 1, NULL, &wr_fds, NULL, NULL) < 0)
+        {
+            return -1;
+        }
+
+        ssize_t ret = write(fd, char_buf + written, len - written);
+        if (ret < 0)
+        {
+            return -1;
+        }
+
+        written += ret;
+    }
+
+    return written;
+}
+
 int tls_established(WOLFSSL* ssl)
 {
     fd_pty = create_pty();
@@ -239,6 +262,7 @@ int tls_established(WOLFSSL* ssl)
 
     fprintf(stderr, "Connected\n");
 
+    unlockpt(fd_pty);
     printf("%s\n", ptsname(fd_pty));
 
     int ret = 0;
@@ -250,7 +274,15 @@ int tls_established(WOLFSSL* ssl)
         FD_SET(fd_pty, &rd_fds);
         FD_SET(fd_tty, &rd_fds);
 
-        if (select(2, &rd_fds, NULL, NULL, NULL) < 0)
+        int nfds = (fd_pty > fd_tty ? fd_pty : fd_tty) + 1;
+
+        struct timeval timeout =
+        {
+            .tv_sec = 0,
+            .tv_usec = 50000
+        };
+
+        if (select(nfds, &rd_fds, NULL, NULL, &timeout) < 0)
         {
             fprintf(stderr, "Error calling select\n");
             ret = 1;
@@ -259,30 +291,34 @@ int tls_established(WOLFSSL* ssl)
 
         int error;
 
-        int pty_read = read(fd_pty, buffer, sizeof(buffer));
-        if (pty_read > 0)
+        if (FD_ISSET(fd_pty, &rd_fds))
         {
-            ret = wolfSSL_write(ssl, buffer, pty_read);
-            error = wolfSSL_get_error(ssl, 0);
-            if (ret != pty_read)
+            int pty_read = read(fd_pty, buffer, sizeof(buffer));
+            if (pty_read > 0)
             {
-                if (error != SSL_ERROR_WANT_READ &&
-                    error != SSL_ERROR_WANT_WRITE)
+                ret = wolfSSL_write(ssl, buffer, pty_read);
+                error = wolfSSL_get_error(ssl, 0);
+                if (ret != pty_read)
                 {
-                    fprintf(stderr, "SSL Write failed ret = %d err = %d (%s)\n",
-                            ret, error, wolfSSL_ERR_error_string(error, err));
-                    ret = 1;
-                    break;
+                    if (error != SSL_ERROR_WANT_READ &&
+                        error != SSL_ERROR_WANT_WRITE)
+                    {
+                        fprintf(stderr, "SSL Write failed ret = %d err = %d (%s)\n",
+                                ret, error, wolfSSL_ERR_error_string(error, err));
+                        ret = 1;
+                        break;
+                    }
                 }
             }
-        }
-        else if (pty_read < 0)
-        {
-            fprintf(stderr, "PTY read failed\n");
-            break;
+            else if (pty_read < 0)
+            {
+                perror("PTY read failed");
+                ret = 1;
+                break;
+            }
         }
 
-        while (wolfSSL_pending(ssl) > 0)
+        if (FD_ISSET(fd_tty, &rd_fds))
         {
             ret = wolfSSL_read(ssl, buffer, sizeof(buffer));
             error = wolfSSL_get_error(ssl, 0);
@@ -299,10 +335,9 @@ int tls_established(WOLFSSL* ssl)
             }
             else if (ret > 0)
             {
-                int pty_write = write(fd_pty, buffer, (size_t)ret);
-                if (pty_write != ret)
+                if (write_all(fd_pty, buffer, ret) != ret)
                 {
-                    fprintf(stderr, "PTY write failed\n");
+                    perror("PTY write failed");
                     ret = 1;
                     break;
                 }
