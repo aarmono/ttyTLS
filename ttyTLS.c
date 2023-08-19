@@ -61,6 +61,9 @@ static int fd_pty = -1;
 static char buffer[1024];
 static char err[80];
 
+static int timeout = -1;
+static speed_t baud_rate = B115200;
+
 const char* get_env_val(const char* var, const char* default_val)
 {
     const char* val = getenv(var);
@@ -123,7 +126,7 @@ void configure_tty(int fd)
     termarg.c_cc[VMIN] = 1;
     termarg.c_cc[VTIME] = 0;
 
-    cfsetspeed(&termarg, B115200);
+    cfsetspeed(&termarg, baud_rate);
 
     tcsetattr(fd, TCSANOW, &termarg);
     flush_tty(fd);
@@ -276,16 +279,29 @@ int tls_established(WOLFSSL* ssl)
 
         int nfds = (fd_pty > fd_tty ? fd_pty : fd_tty) + 1;
 
-        struct timeval timeout =
+        struct timeval tv;
+        if (timeout > 0)
         {
-            .tv_sec = 0,
-            .tv_usec = 50000
+            tv.tv_sec = timeout;
+            tv.tv_usec = 0;
+        }
+        else
+        {
+            tv.tv_sec = 0;
+            tv.tv_usec = 50000;
         };
 
-        if (select(nfds, &rd_fds, NULL, NULL, &timeout) < 0)
+        ret = select(nfds, &rd_fds, NULL, NULL, &tv);
+        if (ret < 0)
         {
             fprintf(stderr, "Error calling select\n");
             ret = 1;
+            break;
+        }
+        else if (timeout > 0 && ret == 0)
+        {
+            fprintf(stderr, "Timeout\n");
+            ret = 0;
             break;
         }
 
@@ -462,18 +478,51 @@ int main(int argc, char* argv[])
     if (argc < 2)
     {
         fprintf(stderr, "usage: ttyTLS [-l] <tty>");
+        return 1;
     }
 
     int is_server = 0;
-    for (int i = 1; i < argc; ++i)
+    char c = 0;
+    while ((c = getopt(argc, argv, "lb:t:")) != -1)
     {
-        if (strcmp(argv[i], "-l") == 0)
+        switch(c)
         {
+        case 'l':
             is_server = 1;
+            break;
+        case 'b':
+            switch(atoi(optarg))
+            {
+            case 9600:
+                baud_rate = B9600;
+                break;
+            case 19200:
+                baud_rate = B19200;
+                break;
+            case 38400:
+                baud_rate = B38400;
+                break;
+            case 57600:
+                baud_rate = B57600;
+                break;
+            case 115200:
+                baud_rate = B115200;
+                break;
+            case 230400:
+                baud_rate = B230400;
+                break;
+            default:
+                fprintf(stderr, "usage: ttyTLS -b (9600|19200|38400|57600|115200|230400)\n");
+                return 1;
+            }
+            break;
+        case 't':
+            timeout = atoi(optarg);
+            break;
         }
     }
 
-    fd_tty = open_tty(argv[argc - 1]);
+    fd_tty = open_tty(argv[optind]);
     if (fd_tty < 0)
     {
         fprintf(stderr, "Error opening tty\n");
@@ -485,12 +534,12 @@ int main(int argc, char* argv[])
     if (is_server)
     {
         fprintf(stderr, "Starting TLS Server\n");
-        ret = tls_server(argv[argc - 1]);
+        ret = tls_server(argv[optind]);
     }
     else
     {
         fprintf(stderr, "Starting TLS Client\n");
-        ret = tls_client(argv[argc - 1]);
+        ret = tls_client(argv[optind]);
     }
 
     wolfSSL_Cleanup();
