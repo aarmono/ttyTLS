@@ -98,7 +98,7 @@ int read_wait(int fd, int timeout)
 
 int read_wont_block(int fd)
 {
-    return read_wait(fd, 0) > 0;
+    return read_wait(fd, 0);
 }
 
 int cb_recv(WOLFSSL *ssl, char *buf, int sz, void *ctx)
@@ -106,9 +106,14 @@ int cb_recv(WOLFSSL *ssl, char *buf, int sz, void *ctx)
     (void) ssl;
     (void) ctx;
 
-    if (read_wont_block(fd_tty))
+    int block = read_wont_block(fd_tty);
+    if (block > 0)
     {
         return (int)read(fd_tty, buf, (size_t)sz);
+    }
+    else if (block < 0)
+    {
+        return WOLFSSL_CBIO_ERR_GENERAL;
     }
     else
     {
@@ -128,7 +133,7 @@ void flush_tty(int fd)
 {
     tcflush(fd, TCIOFLUSH);
 
-    while (read_wont_block(fd))
+    while (read_wont_block(fd) > 0)
     {
         read(fd, buffer, sizeof(buffer));
     }
@@ -317,31 +322,35 @@ int tls_established(WOLFSSL* ssl)
 
         if (FD_ISSET(fd_pty, &rd_fds))
         {
-            int pty_read = read(fd_pty, buffer, sizeof(buffer));
-            if (pty_read > 0)
+            do
             {
-                ret = wolfSSL_write(ssl, buffer, pty_read);
-                error = wolfSSL_get_error(ssl, 0);
-                if (ret != pty_read)
+                int pty_read = read(fd_pty, buffer, sizeof(buffer));
+                if (pty_read > 0)
                 {
-                    if (error != SSL_ERROR_WANT_READ &&
-                        error != SSL_ERROR_WANT_WRITE)
+                    ret = wolfSSL_write(ssl, buffer, pty_read);
+                    error = wolfSSL_get_error(ssl, 0);
+                    if (ret != pty_read)
                     {
-                        fprintf(stderr, "SSL Write failed ret = %d err = %d (%s)\n",
-                                ret, error, wolfSSL_ERR_error_string(error, err));
-                        ret = 1;
-                        loop = 0;
-                        break;
+                        if (error != SSL_ERROR_WANT_READ &&
+                            error != SSL_ERROR_WANT_WRITE)
+                        {
+                            fprintf(stderr, "SSL Write failed ret = %d err = %d (%s)\n",
+                                    ret, error, wolfSSL_ERR_error_string(error, err));
+                            ret = 1;
+                            loop = 0;
+                            break;
+                        }
                     }
                 }
+                else if (pty_read < 0)
+                {
+                    perror("PTY read failed");
+                    ret = 1;
+                    loop = 0;
+                    break;
+                }
             }
-            else if (pty_read < 0)
-            {
-                perror("PTY read failed");
-                ret = 1;
-                loop = 0;
-                break;
-            }
+            while(read_wont_block(fd_pty) > 0);
         }
 
         if (FD_ISSET(fd_tty, &rd_fds))
@@ -416,7 +425,21 @@ int tls_server()
                 return 1;
             }
 
-            read_wait(fd_tty, -1);
+            int connect_wait = read_wait(fd_tty, timeout);
+            if (connect_wait < 0)
+            {
+                perror("Error trying to accept");
+                wolfSSL_free(ssl);
+                wolfSSL_CTX_free(ctx);
+                return 1;
+            }
+            else if (connect_wait == 0)
+            {
+                fprintf(stderr, "Timeout\n");
+                wolfSSL_free(ssl);
+                wolfSSL_CTX_free(ctx);
+                return 1;
+            }
         }
     }
 
@@ -462,7 +485,21 @@ int tls_client()
                 return 1;
             }
 
-            read_wait(fd_tty, -1);
+            int connect_wait = read_wait(fd_tty, timeout);
+            if (connect_wait < 0)
+            {
+                perror("Error trying to connect");
+                wolfSSL_free(ssl);
+                wolfSSL_CTX_free(ctx);
+                return 1;
+            }
+            else if (connect_wait == 0)
+            {
+                fprintf(stderr, "Timeout\n");
+                wolfSSL_free(ssl);
+                wolfSSL_CTX_free(ctx);
+                return 1;
+            }
         }
     }
 
@@ -497,7 +534,7 @@ int main(int argc, char* argv[])
 {
     if (argc < 2)
     {
-        fprintf(stderr, "usage: ttyTLS [-l] <tty>");
+        fprintf(stderr, "usage: ttyTLS [-l] [-b <baud rate>] [-t <timeout>] <tty>");
         return 1;
     }
 
@@ -532,12 +569,17 @@ int main(int argc, char* argv[])
                 baud_rate = B230400;
                 break;
             default:
-                fprintf(stderr, "usage: ttyTLS -b (9600|19200|38400|57600|115200|230400)\n");
+                fprintf(stderr, "Valid baud rates: 9600|19200|38400|57600|115200|230400\n");
                 return 1;
             }
             break;
         case 't':
             timeout = atoi(optarg);
+            if (timeout <= 0)
+            {
+                fprintf(stderr, "Timeout must be > 0\n");
+                return 1;
+            }
             break;
         }
     }
