@@ -18,6 +18,7 @@
 #include <termios.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <pthread.h>
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -270,39 +271,15 @@ ssize_t write_all(int fd, const void* buf, size_t len)
     return written;
 }
 
-int tls_established(WOLFSSL* ssl)
+void* reader_thread(void* arg)
 {
-    fd_pty = create_pty();
-    if (fd_pty < 0)
-    {
-        return 1;
-    }
-
-    fprintf(stderr, "Connected\n");
-
-    unlockpt(fd_pty);
-    printf("%s\n", ptsname(fd_pty));
-    fflush(stdout);
+    WOLFSSL* ssl = (WOLFSSL*)arg;
 
     int loop = 1;
     int ret = 0;
     while (loop)
     {
-        fd_set rd_fds;
-        FD_ZERO(&rd_fds);
-
-        FD_SET(fd_pty, &rd_fds);
-        FD_SET(fd_tty, &rd_fds);
-
-        int nfds = (fd_pty > fd_tty ? fd_pty : fd_tty) + 1;
-
-        struct timeval tv =
-        {
-            .tv_sec = timeout,
-            .tv_usec = 0
-        };
-
-        ret = select(nfds, &rd_fds, NULL, NULL, timeout > 0 ? &tv : NULL);
+        ret = read_wait(fd_pty, timeout > 0 ? timeout : -1);
         if (ret < 0)
         {
             fprintf(stderr, "Error calling select\n");
@@ -318,77 +295,118 @@ int tls_established(WOLFSSL* ssl)
             break;
         }
 
-        int error;
-
-        if (FD_ISSET(fd_pty, &rd_fds))
+        int pty_read = read(fd_pty, buffer, sizeof(buffer));
+        if (pty_read > 0)
         {
-            do
+            ret = wolfSSL_write(ssl, buffer, pty_read);
+            int error = wolfSSL_get_error(ssl, 0);
+            if (ret != pty_read)
             {
-                int pty_read = read(fd_pty, buffer, sizeof(buffer));
-                if (pty_read > 0)
+                if (error != SSL_ERROR_WANT_READ &&
+                    error != SSL_ERROR_WANT_WRITE)
                 {
-                    ret = wolfSSL_write(ssl, buffer, pty_read);
-                    error = wolfSSL_get_error(ssl, 0);
-                    if (ret != pty_read)
-                    {
-                        if (error != SSL_ERROR_WANT_READ &&
-                            error != SSL_ERROR_WANT_WRITE)
-                        {
-                            fprintf(stderr, "SSL Write failed ret = %d err = %d (%s)\n",
-                                    ret, error, wolfSSL_ERR_error_string(error, err));
-                            ret = 1;
-                            loop = 0;
-                            break;
-                        }
-                    }
-                }
-                else if (pty_read < 0)
-                {
-                    perror("PTY read failed");
+                    fprintf(stderr, "SSL Write failed ret = %d err = %d (%s)\n",
+                            ret, error, wolfSSL_ERR_error_string(error, err));
                     ret = 1;
                     loop = 0;
                     break;
                 }
             }
-            while(read_wont_block(fd_pty) > 0);
         }
-
-        if (FD_ISSET(fd_tty, &rd_fds))
+        else if (pty_read < 0)
         {
-            do
-            {
-                ret = wolfSSL_read(ssl, buffer, sizeof(buffer));
-                error = wolfSSL_get_error(ssl, 0);
-                if (ret < 0)
-                {
-                    if (error != SSL_ERROR_WANT_READ &&
-                        error != SSL_ERROR_WANT_WRITE)
-                    {
-                        fprintf(stderr, "SSL Read failed ret = %d err = %d (%s)\n",
-                                ret, error, wolfSSL_ERR_error_string(error, err));
-                        ret = 1;
-                        loop = 0;
-                        break;
-                    }
-                }
-                else if (ret > 0)
-                {
-                    if (write_all(fd_pty, buffer, ret) != ret)
-                    {
-                        perror("PTY write failed");
-                        ret = 1;
-                        loop = 0;
-                        break;
-                    }
-                }
-            }
-            while (wolfSSL_pending(ssl) > 0);
+            perror("PTY read failed");
+            ret = 1;
+            loop = 0;
+            break;
         }
     }
 
-    close(fd_pty);
+    return (void*)((intptr_t)ret);
+}
 
-    return ret;
+void* writer_thread(void* arg)
+{
+    WOLFSSL* ssl = (WOLFSSL*)arg;
+
+    int loop = 1;
+    int ret = 0;
+    while (loop)
+    {
+        ret = read_wait(fd_tty, timeout > 0 ? timeout : -1);
+        if (ret < 0)
+        {
+            fprintf(stderr, "Error calling select\n");
+            ret = 1;
+            loop = 0;
+            break;
+        }
+        else if (ret == 0)
+        {
+            fprintf(stderr, "Timeout\n");
+            ret = 0;
+            loop = 0;
+            break;
+        }
+
+        ret = wolfSSL_read(ssl, buffer, sizeof(buffer));
+        int error = wolfSSL_get_error(ssl, 0);
+        if (ret < 0)
+        {
+            if (error != SSL_ERROR_WANT_READ &&
+                error != SSL_ERROR_WANT_WRITE)
+            {
+                fprintf(stderr, "SSL Read failed ret = %d err = %d (%s)\n",
+                        ret, error, wolfSSL_ERR_error_string(error, err));
+                ret = 1;
+                loop = 0;
+                break;
+            }
+        }
+        else if (ret > 0)
+        {
+            if (write_all(fd_pty, buffer, ret) != ret)
+            {
+                perror("PTY write failed");
+                ret = 1;
+                loop = 0;
+                break;
+            }
+        }
+    }
+
+    return (void*)((intptr_t)ret);
+}
+
+int tls_established(WOLFSSL* ssl)
+{
+    fd_pty = create_pty();
+    if (fd_pty < 0)
+    {
+        return 1;
+    }
+
+    fprintf(stderr, "Connected\n");
+
+    unlockpt(fd_pty);
+    printf("%s\n", ptsname(fd_pty));
+    fflush(stdout);
+
+    pthread_t reader;
+    if (pthread_create(&reader, NULL, reader_thread, ssl) != 0)
+    {
+        fprintf(stderr, "Could not create reader thread\n");
+        close(fd_pty);
+    }
+
+    intptr_t wr_ret = (intptr_t)writer_thread(ssl);
+    intptr_t rd_ret = 0;
+
+    pthread_cancel(reader);
+    close(fd_pty);
+    pthread_join(reader, (void**)&rd_ret);
+
+    return (int)(wr_ret || rd_ret);
 }
 
 int tls_server()
