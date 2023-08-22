@@ -26,3 +26,11 @@ message(STATUS "WOLFSSL_LIB => ${WOLFSSL_LIB}")
 add_executable(ttyTLS ttyTLS.c)
 target_compile_definitions(ttyTLS PUBLIC -D_XOPEN_SOURCE -D_XOPEN_SOURCE_EXTENDED -D_DEFAULT_SOURCE)
 target_link_libraries(ttyTLS ${CMAKE_REQUIRED_LIBRARIES} ${WOLFSSL_LIB} m)
+
+add_executable(dtr_hup dtr_hup.c)
+target_compile_definitions(dtr_hup PUBLIC -D_XOPEN_SOURCE -D_XOPEN_SOURCE_EXTENDED -D_DEFAULT_SOURCE)
+target_link_libraries(dtr_hup ${CMAKE_REQUIRED_LIBRARIES} m)
+
+add_executable(tcflush tcflush.c)
+target_compile_definitions(tcflush PUBLIC -D_XOPEN_SOURCE -D_XOPEN_SOURCE_EXTENDED -D_DEFAULT_SOURCE)
+target_link_libraries(tcflush ${CMAKE_REQUIRED_LIBRARIES} m)
